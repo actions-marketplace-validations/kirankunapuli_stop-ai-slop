@@ -6,8 +6,8 @@
     "url": "https://github.com/kirankunapuli"
   },
   "metadata": {
-    "description": "Detect and remove AI-generated code slop.",
-    "version": "1.0.0"
+    "description": "Detects and removes AI-generated slop from code and from generated prose.",
+    "version": "1.5.0"
   },
   "plugins": [
     {

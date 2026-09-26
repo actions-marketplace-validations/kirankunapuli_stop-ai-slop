@@ -5,6 +5,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, appendFileSync } from "node:fs";
 import { callModel } from "./model.mjs";
+import { buildDetectPrompt, buildVerifyPrompt, extractFindings } from "./prompt.mjs";
 
 const MARKER = "<!-- stop-ai-slop -->";
 
@@ -28,11 +29,16 @@ function fail(message) {
 }
 
 function setOutput(name, value) {
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${name}<<EOF\n${value}\nEOF\n`);
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${name}<<EOF_${name}\n${value}\nEOF_${name}\n`);
 }
 
 function getDiff(maxChars) {
-  const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+  let event;
+  try {
+    event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+  } catch (error) {
+    fail(`could not read the GitHub event at ${process.env.GITHUB_EVENT_PATH}: ${error.message}`);
+  }
   const ZERO = "0".repeat(40);
 
   if (event.pull_request) {
@@ -41,7 +47,12 @@ function getDiff(maxChars) {
     tryRun("git", ["fetch", "--no-tags", "origin", base, head]);
     const diff = tryRun("git", ["diff", "--unified=3", `${base}...${head}`]);
     if (diff === null) fail("could not diff the pull request. Check out the repository with fetch-depth: 0.");
-    return { diff: truncate(diff, maxChars), number: event.pull_request.number };
+    return {
+      diff: truncate(diff, maxChars),
+      number: event.pull_request.number,
+      title: event.pull_request.title ?? "",
+      body: event.pull_request.body ?? "",
+    };
   }
 
   if (event.after) {
@@ -50,7 +61,7 @@ function getDiff(maxChars) {
       ? tryRun("git", ["diff", "--unified=3", `${before}...${event.after}`])
       : tryRun("git", ["diff", "--unified=3", "4b825dc642cb6eb9a060e54bf8d69288fbee4904", event.after]);
     if (diff === null) fail("could not diff the push. Check out the repository with fetch-depth: 0.");
-    return { diff: truncate(diff, maxChars), number: null };
+    return { diff: truncate(diff, maxChars), number: null, title: "", body: "" };
   }
 
   fail("only pull_request and push events are supported");
@@ -61,20 +72,16 @@ function truncate(text, maxChars) {
   return `${text.slice(0, maxChars)}\n\n[stop-ai-slop: diff truncated at ${maxChars} characters]`;
 }
 
-async function review(providerName, baseUrlOverride, apiKey, model, diff) {
+async function review(providerName, baseUrlOverride, apiKey, model, diff, title, body) {
   const skill = readFileSync(process.env.SKILL_PATH, "utf8");
-  const prompt = [
-    "Review the pull request diff below. Detect only. Do not rewrite or apply fixes.",
-    "Report findings as one line each, ordered by severity: `path:line: problem. fix.`",
-    "For prose (commit or PR text) quote the phrase instead of a line number.",
-    "If there is no slop, reply with exactly: NO_SLOP",
-    "",
-    "DIFF:",
-    diff,
-  ].join("\n");
+  const ask = (prompt) => callModel({ provider: providerName, baseUrl: baseUrlOverride, apiKey, model, system: skill, prompt });
 
   try {
-    return await callModel({ provider: providerName, baseUrl: baseUrlOverride, apiKey, model, system: skill, prompt });
+    const first = await ask(buildDetectPrompt({ diff, title, body }));
+    if (!first || first.trim() === "NO_SLOP") return "NO_SLOP";
+    const verified = await ask(buildVerifyPrompt({ diff, findings: first }));
+    const kept = extractFindings(verified);
+    return kept.length ? kept.join("\n") : "NO_SLOP";
   } catch (error) {
     fail(String(error?.message ?? error));
   }
@@ -104,7 +111,7 @@ const model = input("INPUT_MODEL", "gpt-6-luna");
 const baseUrl = input("INPUT_BASE_URL");
 const maxChars = Number(input("INPUT_MAX_DIFF_CHARS", "40000"));
 
-const { diff, number } = getDiff(maxChars);
+const { diff, number, title, body } = getDiff(maxChars);
 if (!diff.trim()) {
   console.log("stop-ai-slop: empty diff, nothing to review");
   setOutput("findings", "false");
@@ -112,7 +119,7 @@ if (!diff.trim()) {
   process.exit(0);
 }
 
-const result = await review(provider, baseUrl, apiKey, model, diff);
+const result = await review(provider, baseUrl, apiKey, model, diff, title, body);
 const hasFindings = result !== "NO_SLOP" && result.length > 0;
 
 setOutput("findings", String(hasFindings));

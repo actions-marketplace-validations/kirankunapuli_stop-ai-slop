@@ -13,6 +13,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { callModel } from "../scripts/model.mjs";
+import { buildDetectPrompt, buildVerifyPrompt, extractFindings } from "../scripts/prompt.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..");
@@ -24,9 +25,16 @@ const provider = process.env.EVAL_PROVIDER || "openai";
 const model = process.env.EVAL_MODEL || "gpt-6-luna";
 const baseUrl = process.env.EVAL_BASE_URL || "";
 const apiKey = process.env.EVAL_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY || "";
-const minRecall = Number(process.env.EVAL_MIN_RECALL || "0.75");
+const minF1 = Number(process.env.EVAL_MIN_F1 || "0.75");
+const mode = process.env.EVAL_MODE || "strict";
 
-const expected = JSON.parse(readFileSync(join(here, "expected.json"), "utf8"));
+let expected;
+try {
+  expected = JSON.parse(readFileSync(join(here, "expected.json"), "utf8"));
+} catch (error) {
+  console.error(`evals/expected.json is not valid JSON: ${error.message}`);
+  process.exit(1);
+}
 const skill = readFileSync(join(repoRoot, "skills", "stop-ai-slop", "SKILL.md"), "utf8");
 
 const plan = Object.entries(expected);
@@ -44,7 +52,7 @@ if (!apiKey) {
   process.exit(2);
 }
 
-console.log(`stop-ai-slop eval | provider=${provider} model=${model} fixtures=${plan.length}\n`);
+console.log(`stop-ai-slop eval | provider=${provider} model=${model} mode=${mode} fixtures=${plan.length}\n`);
 process.exit(await run(plan));
 
 async function run(plan) {
@@ -56,26 +64,18 @@ async function run(plan) {
   for (const [file, patterns] of plan) {
     const path = join(here, "fixtures", file);
     const content = readFileSync(path, "utf8");
-    const prompt = [
-      "Detect all slop in the file below. Detect only, do not rewrite.",
-      "List every finding as one line: `path:line: problem. fix.`",
-      "If there is no slop, reply with exactly: NO_SLOP",
-      "",
-      `FILE: ${file}`,
-      "```",
-      content,
-      "```",
-    ].join("\n");
-
-    const answer = await callModel({ provider, baseUrl, apiKey, model, system: skill, prompt });
-    const findings = parseFindings(answer);
+    const answer = await callModel({ provider, baseUrl, apiKey, model, system: skill, prompt: buildDetectPrompt({ diff: content, title: file, mode }) });
+    const raw = answer.trim() === "NO_SLOP"
+      ? answer
+      : await callModel({ provider, baseUrl, apiKey, model, system: skill, prompt: buildVerifyPrompt({ diff: content, findings: answer }) });
+    const findings = extractFindings(raw);
     const matched = patterns.filter((p) => findings.some((f) => includesAny(f, p.match)));
     const falsePositives = findings.filter((f) => !patterns.some((p) => includesAny(f, p.match)));
 
     totalExpected += patterns.length;
     totalHits += matched.length;
-    totalFalsePositives += patterns.length === 0 ? 0 : falsePositives.length;
-    if (patterns.length === 0) cleanFindings = findings.length;
+    totalFalsePositives += patterns.length === 0 ? findings.length : falsePositives.length;
+    if (patterns.length === 0) cleanFindings += findings.length;
 
     const recall = patterns.length ? (matched.length / patterns.length).toFixed(2) : "n/a";
     console.log(`${file}`);
@@ -90,12 +90,13 @@ async function run(plan) {
 
   const recall = totalExpected ? totalHits / totalExpected : 1;
   const precision = totalHits + totalFalsePositives ? totalHits / (totalHits + totalFalsePositives) : 1;
-  console.log(`summary: recall ${recall.toFixed(2)} (${totalHits}/${totalExpected}), precision ${precision.toFixed(2)}, extra findings ${totalFalsePositives}`);
+  const f1 = precision + recall ? (2 * precision * recall) / (precision + recall) : 0;
+  console.log(`summary: recall ${recall.toFixed(2)} (${totalHits}/${totalExpected}), precision ${precision.toFixed(2)}, F1 ${f1.toFixed(2)}, extra findings ${totalFalsePositives}`);
   console.log(`clean fixture findings: ${cleanFindings}`);
 
   let failed = false;
-  if (recall < minRecall) {
-    console.error(`FAIL: recall ${recall.toFixed(2)} below ${minRecall}`);
+  if (f1 < minF1) {
+    console.error(`FAIL: F1 ${f1.toFixed(2)} below ${minF1}`);
     failed = true;
   }
   if (cleanFindings > 0) {
@@ -105,16 +106,11 @@ async function run(plan) {
   return failed ? 1 : 0;
 }
 
-function parseFindings(answer) {
-  return answer
-    .split("\n")
-    .map((line) => line.trim().replace(/^[-*]\s+/, "").trim())
-    .filter((line) => line && line !== "NO_SLOP" && !/^[`~]{1,}$/.test(line) && !/^```/.test(line))
-    .map((line) => line.replace(/^`|`$/g, "").trim())
-    .filter(Boolean);
-}
-
 function includesAny(line, keys) {
   const lower = line.toLowerCase();
-  return keys.some((key) => lower.includes(key.toLowerCase()));
+  return keys.some((key) => new RegExp(`\\b${escapeRegex(key.toLowerCase())}(?:s|es|ed|ing|ion|ions)?\\b`).test(lower));
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

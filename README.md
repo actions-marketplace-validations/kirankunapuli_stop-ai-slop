@@ -117,13 +117,13 @@ AI output has a specific failure mode: it reads like quality. Reviewers approve 
 - **Agents game the tests.** A 2025 study of frontier models on engineering tasks found reward hacking in 30.4% of runs: edited assertions, disabled tests, monkey-patched runners, and one agent that overrode Python's equality check so every test passed. A benchmark agent scored 97% on visible compiler tests and 0% on held-out tests by hashing inputs to stored answers. ([summary](https://tianpan.co/blog/2026/04/17/specification-gaming-production-ai-agents), [SpecBench](https://www.weco.ai/blog/specbench))
 - **The code looks plausible while being wrong.** Off-by-one errors, inverted conditions, and skipped edge cases survive review because the code runs and reads correctly. ([survey](https://arxiv.org/abs/2512.05239))
 - **AI tests create a coverage illusion.** They assert that a function did not throw, assert on the mock, or mirror the implementation including its bugs. ([Vitest](https://main.vitest.dev/guide/learn/writing-tests-with-ai))
-- **AI bloat passes inspection.** Single-use factories, redundant indirection, and unnecessary abstractions resemble patterns reviewers recognise as good. ([Bryan Finster](https://bryanfinster.substack.com/p/ai-broke-your-code-review-heres-how))
+- **AI bloat passes inspection.** Single-use factories, redundant indirection, and unnecessary abstractions resemble patterns reviewers recognize as good. ([Bryan Finster](https://bryanfinster.substack.com/p/ai-broke-your-code-review-heres-how))
 
 ## What it catches
 
 Full catalog in [SKILL.md](skills/stop-ai-slop/SKILL.md). The groups:
 
-- **Wrong or unverified behavior.** Plausible-but-wrong logic, hallucinated APIs and packages, swallowed errors, missing trust-boundary checks, secrets in code, retries that ignore `Retry-After`, non-idempotent retries and race conditions, N+1 queries and unbounded result sets.
+- **Wrong or unverified behavior.** Plausible-but-wrong logic, hallucinated APIs and packages, swallowed errors, missing trust-boundary checks, secrets in code, string-built SQL and shell commands, money as float and naive datetimes, blocking calls in async code, retries that ignore `Retry-After`, non-idempotent retries and race conditions, N+1 queries and unbounded result sets.
 - **Structure that does not pay for itself.** One-implementation interfaces, single-product factories, reinvented standard library, god functions, shotgun diffs, architecture violations.
 - **Naming and comments.** Generic names, comments that restate the code, stale comments and docs.
 - **Excess and noise.** Defensive bloat, dead code, formatting churn.
@@ -244,18 +244,29 @@ The catalog follows Anthropic's [skill authoring guidance](https://platform.clau
 
 ## Evaluation
 
-A skill is a claim until it is measured. This repo ships a small benchmark: three labeled fixtures (two sloppy, one clean) and a harness that scores recall, precision, and false positives on the clean file.
+A skill is a claim until it is measured. This repo ships a small benchmark: six labeled fixtures (four sloppy, two clean) and a harness that scores recall, precision, F1, and false positives on the clean files.
 
 ```bash
 EVAL_API_KEY=... node evals/run.mjs
 ```
 
-| Model | Recall | Precision | Findings on clean |
-|---|---|---|---|
-| `gpt-6-luna` (default) | 1.00 (10/10) | 0.91 | 0 |
-| `claude-haiku-4-5-20251001` | 1.00 (10/10) | 0.83 | 0 |
+| Mode | Used by | Recall | Precision | F1 | Findings on clean |
+|---|---|---|---|---|---|
+| `strict` | the GitHub Action, CI | 0.79 to 0.89 | 1.00 | 0.88 to 0.94 | 0 |
+| `sweep` | interactive fix mode | 1.00 (19/19) | 1.00 | 1.00 | 0 |
+
+Both numbers are real and both are reproducible. The difference is the trade the tool makes on purpose:
+
+- **strict** reports only what it is confident about. Precision first, because a reviewer who gets wrong findings turns the tool off. This is what CI runs.
+- **sweep** works the whole rule list. Recall 1.00, because a human is in the loop and can reject. This is what the agent uses when fixing code.
+
+The action runs twice: a first pass finds defects, a second pass removes questions, guesses, and boundary-validation complaints. The eval imports the same prompt file, so the numbers describe what the action sends. Temperature is 0.
+
+`gpt-6-luna` is the default. Its last measurement, on the earlier three-fixture set, was 1.00 recall and 0.91 precision. Re-measurement waits on API credits.
 
 The harness fails when recall drops below the threshold or when the skill invents a finding on clean code. That second check matters most: a skill that invents problems is worse than one that misses a few. Method, limitations, and how to add a fixture: [evals/README.md](evals/README.md).
+
+Measured on code it did not influence: [docs/case-study.md](docs/case-study.md) runs the skill over three real agent-authored pull requests and publishes the wrong findings as well as the right ones.
 
 ## Repository layout
 
@@ -269,6 +280,7 @@ The harness fails when recall drops below the threshold or when the skill invent
 ├── action.yml                # composite GitHub Action
 ├── scripts/
 │   ├── review.mjs            # PR review runner, no dependencies
+│   ├── prompt.mjs            # detect and verify prompts, shared with the eval
 │   └── model.mjs             # shared provider calls
 ├── evals/                    # labeled fixtures and scoring harness
 │   ├── README.md
@@ -278,9 +290,10 @@ The harness fails when recall drops below the threshold or when the skill invent
 ├── examples/pr-review.yml    # consumer workflow example
 ├── demo/                     # VHS recording, sample file, one-command rebuild
 ├── docs/agents.md            # all 79 supported agents
+├── docs/case-study.md        # the skill measured on three real agent PRs
 ├── .claude-plugin/           # Claude Code plugin manifests
 ├── .markdownlint.json        # markdown lint config
-└── .github/workflows/        # validate.yml
+└── .github/workflows/        # validate.yml, eval.yml
 ```
 
 ## Development
@@ -306,10 +319,6 @@ A skill needs `name` (lowercase and hyphens, 64 characters maximum, no reserved 
 ## Contributing
 
 Open an issue or a pull request. New slop patterns are welcome when they are concrete and detectable, not a matter of taste. Keep `SKILL.md` tight: every rule must earn its place.
-
-## Star history
-
-[![Star History Chart](https://api.star-history.com/svg?repos=kirankunapuli/stop-ai-slop&type=Date)](https://star-history.com/#kirankunapuli/stop-ai-slop&Date)
 
 ## License
 
